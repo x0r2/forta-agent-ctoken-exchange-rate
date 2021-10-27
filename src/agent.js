@@ -4,6 +4,9 @@ const BigNumber = require('bignumber.js');
 const Web3 = require('web3');
 
 const {
+    Finding,
+    FindingSeverity,
+    FindingType,
     createTransactionEvent,
     getJsonRpcUrl
 } = require('forta-agent');
@@ -154,6 +157,18 @@ const handleTransaction = async (txEvent) => {
         console.log('exchangeRateStored', exchangeRateStored);
         console.log('exchangeRateCurrent', exchangeRateCurrent);
         console.log();
+
+        const cTokenNameUpper = C_TOKEN_NAME.toUpperCase();
+
+        findings.push(
+            Finding.fromObject({
+                name: 'Compound Token Exchange Rate Goes Down',
+                description: `Compound token (${C_TOKEN_NAME}) exchange rate goes down`,
+                alertId: `COMPOUND-${cTokenNameUpper}-EXCHANGE-RATE-DOWN-1`,
+                severity: FindingSeverity.Medium,
+                type: FindingType.Info
+            })
+        );
     }
 
     return findings;
