@@ -4,39 +4,45 @@ const BigNumber = require('bignumber.js');
 const Web3 = require('web3');
 
 const {
-    Finding,
-    FindingSeverity,
-    FindingType,
-    getJsonRpcUrl
+    createTransactionEvent
 } = require('forta-agent');
 
-const web3 = new Web3(getJsonRpcUrl());
+const {
+    C_TOKEN_NAME,
+    C_TOKEN_ADDRESS,
+    TOKEN_ADDRESS,
+    TRANSFER_EVENT,
+    ACCRUE_INTEREST,
+    BORROW_EVENT,
+    REPAY_BORROW,
+    RESERVED_REDUCED
+} = require('./constants.js');
 
-const C_TOKEN_NAME = 'cBAT';
-
-const C_TOKEN_ADDRESS = '0x6C8c6b02E7b2BE14d4fA6022Dfd6d75921D90E4E';
-const TOKEN_ADDRESS = '0x0d8775f648430679a709e98d2b0cb6250d2887ef';
-
-const BORROW_EVENT = 'Borrow(address,uint256,uint256,uint256)';
-const TRANSFER_EVENT = 'Transfer(address,address,uint256)';
-const ACCRUE_INTEREST = 'AccrueInterest(uint256,uint256,uint256)';
-const REPAY_BORROW = 'RepayBorrow(address,address,uint256,uint256,uint256)';
-const RESERVED_REDUCED = 'ReservesReduced(address,uint256,uint256)';
+const web3 = new Web3('https://eth-mainnet.gateway.pokt.network/v1/5f3453978e354ab992c4da79');
 
 const cTokenAbi = require(`./${C_TOKEN_NAME}.json`);
 const cToken = new web3.eth.Contract(cTokenAbi, C_TOKEN_ADDRESS);
 
+const EXP = Math.pow(10, 18);
+
 let totalCash;
+let totalSupply;
 let totalBorrows;
 let totalReserves;
-let totalSupply;
 let reserveFactor;
 let exchangeRate;
 
 const handleTransaction = async (txEvent) => {
     const findings = [];
 
-    const toAddress = txEvent.to.toLowerCase();
+    txEvent = createTransactionEvent(txEvent);
+    let toAddress = txEvent.transaction.to;
+
+    if (!toAddress) {
+        return findings;
+    }
+
+    toAddress = toAddress.toLowerCase();
 
     if (toAddress !== C_TOKEN_ADDRESS) {
         return findings;
@@ -44,43 +50,42 @@ const handleTransaction = async (txEvent) => {
 
     const block = txEvent.block.number;
 
+    // DEBUG
+    console.log('\nBlock', block);
+    console.log();
+
     if (exchangeRate === undefined) {
-        totalCash = await getTotalCash(cToken, block);
-        totalBorrows = await getTotalBorrows(cToken, block);
-        totalReserves = await getTotalReserves(cToken, block);
-        totalSupply = await getTotalSupply(cToken, block);
-        reserveFactor = await getReserveFactor(cToken, block);
+        [totalCash, totalSupply, totalBorrows, totalReserves, reserveFactor] = await Promise.all([
+            getTotalCash(cToken, block),
+            getTotalSupply(cToken, block),
+            getTotalBorrows(cToken, block),
+            getTotalReserves(cToken, block),
+            getReserveFactor(cToken, block)
+        ]);
 
         exchangeRate = calcExchangeRate(totalCash, totalBorrows, totalReserves, totalSupply);
 
         // DEBUG
-        console.log('totalCash', totalCash.toFixed(10));
-        console.log('totalBorrows', totalBorrows.toFixed(10));
-        console.log('totalReserves', totalReserves.toFixed(10));
-        console.log('totalSupply', totalSupply.toFixed(10));
-        console.log('reserveFactor', reserveFactor.toFixed(10));
-        console.log('exchangeRate', exchangeRate.toFixed(10));
+        console.log('Init totalCash', totalCash.toFixed(5));
+        console.log('Init totalSupply', totalSupply.toFixed(5));
+        console.log('Init totalBorrows', totalBorrows.toFixed(5));
+        console.log('Init totalReserves', totalReserves.toFixed(5));
+        console.log('Init reserveFactor', reserveFactor.toFixed(5));
+        console.log('Init exchangeRate', exchangeRate.toFixed(5));
 
         // DEBUG
         const exchangeRateStored = await cToken.methods.exchangeRateStored().call(undefined, block);
-        console.log('exchangeRateStored', exchangeRateStored);
+        const exchangeRateCurrent = await cToken.methods.exchangeRateCurrent().call(undefined, block);
 
         // DEBUG
-        const exchangeRateCurrent = await cToken.methods.exchangeRateCurrent().call(undefined, block);
+        console.log('exchangeRateStored', exchangeRateStored);
         console.log('exchangeRateCurrent', exchangeRateCurrent);
-
         console.log();
 
         return findings;
     }
 
     let exchangeRateNew;
-
-    const borrowEvents = txEvent.filterEvent(BORROW_EVENT);
-
-    for (const borrowEvent of borrowEvents) {
-        exchangeRateNew = updateBorrowEvent(borrowEvent);
-    }
 
     const transferEvents = txEvent.filterEvent(TRANSFER_EVENT);
 
@@ -92,6 +97,12 @@ const handleTransaction = async (txEvent) => {
 
     for (const accrueInterestEvent of accrueInterestEvents) {
         exchangeRateNew = updateAccrueInterestEvent(accrueInterestEvent);
+    }
+
+    const borrowEvents = txEvent.filterEvent(BORROW_EVENT);
+
+    for (const borrowEvent of borrowEvents) {
+        exchangeRateNew = updateBorrowEvent(borrowEvent);
     }
 
     const repayBorrowEvents = txEvent.filterEvent(REPAY_BORROW);
@@ -106,50 +117,46 @@ const handleTransaction = async (txEvent) => {
         exchangeRateNew = updateReservesReducedEvent(reservesReducedEvent);
     }
 
-    if (exchangeRateNew !== undefined && exchangeRateNew.isLessThan(exchangeRate)) {
-        const cTokenNameUpper = C_TOKEN_NAME.toUpperCase();
+    if (exchangeRateNew) {
+        // DEBUG
+        console.log('exchangeRateNew', exchangeRateNew.toFixed(5));
 
-        findings.push(
-            Finding.fromObject({
-                name: 'Compound Token Exchange Rate Goes Down',
-                description: `Compound token (${C_TOKEN_NAME}) exchange rate goes down`,
-                alertId: `COMPOUND-${cTokenNameUpper}-EXCHANGE-RATE-DOWN-1`,
-                severity: FindingSeverity.Medium,
-                type: FindingType.Info
-            })
-        );
+        if (exchangeRateNew.isLessThan(exchangeRate)) {
+            console.log('ALERT!');
+        }
+
+        exchangeRate = exchangeRateNew;
+
+        // DEBUG
+        console.log('\nCALCULATED EXCHANGE RATE', exchangeRate.toFixed(5));
+        console.log();
+
+        const [totalCashS, totalSupplyS, totalBorrowsS, totalReservesS, reserveFactorS] = await Promise.all([
+            getTotalCash(cToken, block),
+            getTotalSupply(cToken, block),
+            getTotalBorrows(cToken, block),
+            getTotalReserves(cToken, block),
+            getReserveFactor(cToken, block)
+        ]);
+
+        console.log('totalCash', totalCashS.toFixed(5), totalCash.toFixed(5));
+        console.log('totalSupply', totalSupplyS.toFixed(5), totalSupply.toFixed(5));
+        console.log('totalBorrows', totalBorrowsS.toFixed(5), totalBorrows.toFixed(5));
+        console.log('totalReserves', totalReservesS.toFixed(5), totalReserves.toFixed(5));
+        console.log('reserveFactor', reserveFactorS.toFixed(5), reserveFactor.toFixed(5));
+
+        // DEBUG
+        const exchangeRateStored = await cToken.methods.exchangeRateStored().call(undefined, block);
+        const exchangeRateCurrent = await cToken.methods.exchangeRateCurrent().call(undefined, block);
+
+        // DEBUG
+        console.log('exchangeRateStored', exchangeRateStored);
+        console.log('exchangeRateCurrent', exchangeRateCurrent);
+        console.log();
     }
 
     return findings;
 };
-
-function updateBorrowEvent(event) {
-    const parsedData = web3.eth.abi.decodeParameters(['address', 'uint256', 'uint256', 'uint256'], event.data);
-    totalBorrows = new BigNumber(parsedData[3]);
-    return updateExchangeRate();
-}
-
-function updateRepayBorrowEvent(event) {
-    const parsedData = web3.eth.abi.decodeParameters(['address', 'address', 'uint256', 'uint256', 'uint256'], event.data);
-    totalBorrows = new BigNumber(parsedData[4]);
-    return updateExchangeRate();
-}
-
-function updateReservesReducedEvent(event) {
-    const parsedData = web3.eth.abi.decodeParameters(['address', 'uint256', 'uint256'], event.data);
-    totalReserves = new BigNumber(parsedData[2]);
-    return updateExchangeRate();
-}
-
-function updateAccrueInterestEvent(event) {
-    const parsedData = web3.eth.abi.decodeParameters(['uint256', 'uint256', 'uint256'], event.data);
-    totalBorrows = new BigNumber(parsedData[2]);
-
-    const interestAccumulated = new BigNumber(parsedData[0]);
-
-    totalReserves = totalReserves.plus(interestAccumulated.multipliedBy(reserveFactor).div(Math.pow(10, 18)));
-    return updateExchangeRate();
-}
 
 function updateTransferEvent(event, cTokenAddress, tokenAddress) {
     const parsedTopic1 = web3.eth.abi.decodeParameters(['address'], event.topics[1]);
@@ -166,46 +173,103 @@ function updateTransferEvent(event, cTokenAddress, tokenAddress) {
     if (eventAddress === cTokenAddress) {
         if (fromAddress === cTokenAddress) {
             totalSupply = totalSupply.plus(value);
-            console.log('updateTransfer totalSupply + ', value.toFixed(10));
 
-            return updateExchangeRate();
+            // DEBUG
+            console.log('updateTransfer totalSupply +', value.toFixed(5));
+
+            return calcExchangeRate(totalCash, totalBorrows, totalReserves, totalSupply);
         } else if (toAddress === cTokenAddress) {
             totalSupply = totalSupply.minus(value);
-            console.log('updateTransfer totalSupply - ', value.toFixed(10));
 
-            return updateExchangeRate();
+            // DEBUG
+            console.log('updateTransfer totalSupply -', value.toFixed(5));
+
+            return calcExchangeRate(totalCash, totalBorrows, totalReserves, totalSupply);
         } else {
-            console.warn('C_TOKEN_ADDRESS not in transaction!');
+            console.log(toAddress, fromAddress);
+            console.warn('cTokenAddress not in transaction!');
         }
     } else if (eventAddress === tokenAddress) {
         if (fromAddress === cTokenAddress) {
             totalCash = totalCash.minus(value);
-            console.log('updateTransfer totalCash - ', value.toFixed(10));
 
-            return updateExchangeRate();
+            // DEBUG
+            console.log('updateTransfer totalCash -', value.toFixed(5));
+
+            return calcExchangeRate(totalCash, totalBorrows, totalReserves, totalSupply);
         } else if (toAddress === cTokenAddress) {
             totalCash = totalCash.plus(value);
-            console.log('updateTransfer totalCash + ', value.toFixed(10));
 
-            return updateExchangeRate();
+            // DEBUG
+            console.log('updateTransfer totalCash +', value.toFixed(5));
+
+            return calcExchangeRate(totalCash, totalBorrows, totalReserves, totalSupply);
         } else {
-            console.warn('C_TOKEN_ADDRESS not in transaction!');
+            console.warn('cTokenAddress not in transaction!');
         }
     } else {
         console.warn('eventAddress not found!');
     }
 }
 
-function updateExchangeRate() {
+function updateAccrueInterestEvent(event) {
+    const parsedData = web3.eth.abi.decodeParameters(['uint256', 'uint256', 'uint256'], event.data);
+    totalBorrows = new BigNumber(parsedData[2]);
+
+    const interestAccumulated = new BigNumber(parsedData[0]);
+
+    totalReserves = calcTotalReserves(totalReserves, interestAccumulated, reserveFactor);
+
+    // DEBUG
+    console.log('updateAccrueInterestEvent', totalBorrows.toFixed(5), totalReserves.toFixed(5));
+
+    return calcExchangeRate(totalCash, totalBorrows, totalReserves, totalSupply);
+}
+
+function updateBorrowEvent(event) {
+    const parsedData = web3.eth.abi.decodeParameters(['address', 'uint256', 'uint256', 'uint256'], event.data);
+    totalBorrows = new BigNumber(parsedData[3]);
+
+    // DEBUG
+    console.log('updateBorrowEvent', totalBorrows.toFixed(5));
+
+    return calcExchangeRate(totalCash, totalBorrows, totalReserves, totalSupply);
+}
+
+function updateRepayBorrowEvent(event) {
+    const parsedData = web3.eth.abi.decodeParameters(['address', 'address', 'uint256', 'uint256', 'uint256'], event.data);
+    totalBorrows = new BigNumber(parsedData[4]);
+
+    // DEBUG
+    console.log('updateRepayBorrowEvent', totalBorrows.toFixed(5));
+
+    return calcExchangeRate(totalCash, totalBorrows, totalReserves, totalSupply);
+}
+
+function updateReservesReducedEvent(event) {
+    const parsedData = web3.eth.abi.decodeParameters(['address', 'uint256', 'uint256'], event.data);
+    totalReserves = new BigNumber(parsedData[2]);
+
+    // DEBUG
+    console.log('updateReservesReducedEvent', totalReserves.toFixed(5));
+
     return calcExchangeRate(totalCash, totalBorrows, totalReserves, totalSupply);
 }
 
 function calcExchangeRate(totalCash, totalBorrows, totalReserves, totalSupply) {
-    return new BigNumber(totalCash.plus(totalBorrows).minus(totalReserves).div(totalSupply));
+    return totalCash.plus(totalBorrows).minus(totalReserves).div(totalSupply).multipliedBy(EXP);
+}
+
+function calcTotalReserves(totalReserves, interestAccumulated, reserveFactor) {
+    return new BigNumber(totalReserves.plus(interestAccumulated.multipliedBy(reserveFactor).div(EXP)).toFixed(0));
 }
 
 async function getTotalCash(cToken, block) {
     return new BigNumber(await cToken.methods.getCash().call(undefined, block));
+}
+
+async function getTotalSupply(cToken, block) {
+    return new BigNumber(await cToken.methods.totalSupply().call(undefined, block));
 }
 
 async function getTotalBorrows(cToken, block) {
@@ -214,10 +278,6 @@ async function getTotalBorrows(cToken, block) {
 
 async function getTotalReserves(cToken, block) {
     return new BigNumber(await cToken.methods.totalReserves().call(undefined, block));
-}
-
-async function getTotalSupply(cToken, block) {
-    return new BigNumber(await cToken.methods.totalSupply().call(undefined, block));
 }
 
 async function getReserveFactor(cToken, block) {
