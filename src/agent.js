@@ -4,7 +4,8 @@ const BigNumber = require('bignumber.js');
 const Web3 = require('web3');
 
 const {
-    createTransactionEvent
+    createTransactionEvent,
+    getJsonRpcUrl
 } = require('forta-agent');
 
 const {
@@ -18,7 +19,7 @@ const {
     RESERVED_REDUCED
 } = require('./constants.js');
 
-const web3 = new Web3('https://eth-mainnet.gateway.pokt.network/v1/5f3453978e354ab992c4da79');
+const web3 = new Web3(getJsonRpcUrl());
 
 const cTokenAbi = require(`./${C_TOKEN_NAME}.json`);
 const cToken = new web3.eth.Contract(cTokenAbi, C_TOKEN_ADDRESS);
